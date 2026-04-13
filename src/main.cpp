@@ -33,7 +33,7 @@ unsigned long lastFetchTime = 0;
 
 // Змінні для збереження стану серво
 int currentServoAngle = 0;    
-const int stepAngle = 60; // Крок повороту (змініть під свою кількість комірок)
+const int stepAngle = 58; // Крок повороту (змініть під свою кількість комірок)
 
 // ================== ЛОГІКА СЕРВО ==================
 void rotatePillDispenser() {
