@@ -6,79 +6,96 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include <ESP32Servo.h>
+#include "time.h"
 
-#include "config.h"      // Має містити AP_SSID та AP_PASSWORD
-#include "utils.h"       // Має містити generateIdentifier()
+#include "config.h"      // AP_SSID, AP_PASSWORD
+#include "utils.h"       // generateIdentifier()
 #include "index_html.h"  
 #include "result_html.h" 
 
-// ================== ОБ'ЄКТИ ТА КОНСТАНТИ ==================
+// ================== НАЛАШТУВАННЯ ТА ПІНИ ==================
 Preferences prefs;
 WebServer webServer(80);
 DNSServer dnsServer;
-IPAddress apIP(192, 168, 4, 1);
+Servo myServo;
 
-#define AP_KEEP_TIME 120000UL 
-#define WIFI_TRIES 40         
+const int servoPin = 18; 
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 10800;      // GMT+3 (Літній час в Україні)
+const int   daylightOffset_sec = 0;     // Вже враховано в офсеті
+
 #define FETCH_INTERVAL 60000UL 
+#define AP_KEEP_TIME 120000UL
 
-
+const String serverUrl = "https://pill-box-e03y.onrender.com/api/schedule";
+const String secret = "12345678";
 
 String deviceId = "";
+String targetTime = ""; // Час із БД
 bool apRunning = false;
 unsigned long apStartTime = 0;
 unsigned long lastFetchTime = 0;
 
-// ================== ФУНКЦІЯ ЗАПИТУ РОЗКЛАДУ ==================
-void fetchSchedule() {
-    if (WiFi.status() != WL_CONNECTED) return;
+// ================== ЛОГІКА СЕРВО ==================
+void rotatePillDispenser() {
+    Serial.println("💊 ЧАС ПРИЙОМУ! Повертаю механізм...");
+    myServo.write(90);  // Поворот для видачі
+    delay(1000);
+    myServo.write(0);   // Повернення
+    Serial.println("✅ Видано.");
+}
 
-    // Створюємо безпечного клієнта для роботи з Render (HTTPS)
-    WiFiClientSecure *client = new WiFiClientSecure;
-    if (client) {
-        client->setInsecure(); // Важливо для обходу перевірки SSL сертифіката
+// ================== СИНХРОНІЗАЦІЯ ЧАСУ ==================
+void checkTimeAndAlarm() {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) return;
 
-        HTTPClient http;
-        String fullUrl = String(REGISTER_URL) + "?device_id=" + deviceId + "&secret=" + String(SECRET);
-        
-        Serial.println("📡 Запит до сервера: " + fullUrl);
-        
-        if (http.begin(*client, fullUrl)) {
-            int httpResponseCode = http.GET();
-            
-            if (httpResponseCode == 200) {
-                String payload = http.getString();
-                Serial.println("📥 Відповідь: " + payload);
+    char currentTime[6];
+    strftime(currentTime, sizeof(currentTime), "%H:%M", &timeinfo);
 
-                // Використовуємо DynamicJsonDocument для обробки JSON
-                DynamicJsonDocument doc(1024);
-                DeserializationError error = deserializeJson(doc, payload);
-
-                if (!error) {
-                    // Отримуємо значення. Оператор | задає текст, якщо ключ відсутній
-                    const char* uId = doc["user_id"] | (doc["userid"] | "невідомо");
-                    const char* t = doc["time"] | "00:00";
-
-                    Serial.println("-------------------------");
-                    Serial.printf("👤 User ID: %s\n", uId);
-                    Serial.printf("⏰ Час прийому: %s\n", t);
-                    Serial.println("-------------------------");
-                } else {
-                    Serial.print("❌ Помилка JSON: ");
-                    Serial.println(error.f_str());
-                }
-            } else {
-                Serial.printf("❌ помилка HTTP: %d\n", httpResponseCode);
-            }
-            http.end();
-        }
-        delete client; // Звільняємо оперативну пам'ять
+    // Якщо поточний час збігається з часом із БД
+    if (targetTime != "" && String(currentTime) == targetTime) {
+        rotatePillDispenser();
+        targetTime = ""; // Скидаємо до наступного оновлення з сервера
     }
 }
 
-// ================== РОБОТА З ПАМ'ЯТТЮ (NVS) ==================
+// ================== ЗАПИТ ДО СЕРВЕРА ==================
+void fetchSchedule() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    WiFiClientSecure *client = new WiFiClientSecure;
+    if (client) {
+        client->setInsecure();
+        HTTPClient http;
+        String fullUrl = String(serverUrl) + "?device_id=" + deviceId + "&secret=" + secret;
+        
+        if (http.begin(*client, fullUrl)) {
+            int httpResponseCode = http.GET();
+            if (httpResponseCode == 200) {
+                String payload = http.getString();
+                DynamicJsonDocument doc(1024);
+                deserializeJson(doc, payload);
+
+                // Підтримка обох структур JSON (пряма строка або масив schedule)
+                if (doc.containsKey("time")) {
+                    targetTime = doc["time"].as<String>();
+                } else if (doc["schedule"].size() > 0) {
+                    targetTime = doc["schedule"][0]["times"][0].as<String>();
+                }
+                
+                Serial.println("🕒 Отримано розклад на: " + targetTime);
+            }
+            http.end();
+        }
+        delete client;
+    }
+}
+
+// ================== КЕРУВАННЯ WIFI ТА ПАМ'ЯТТЮ ==================
 bool loadCredentials(String &devId, String &ssid, String &pass) {
-    prefs.begin("device", false); // false дозволяє створити розділ, якщо його немає
+    prefs.begin("device", false);
     devId = prefs.getString("deviceId", "");
     ssid  = prefs.getString("ssid", "");
     pass  = prefs.getString("password", "");
@@ -94,15 +111,14 @@ void saveCredentials(const String &devId, const String &ssid, const String &pass
     prefs.end();
 }
 
-// ================== ТОЧКА ДОСТУПУ (AP) ==================
 void startAP() {
     if (apRunning) return;
-    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
     WiFi.softAP(AP_SSID, AP_PASSWORD);
-    dnsServer.start(53, "*", apIP);
+    dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
     apRunning = true;
     apStartTime = millis();
-    Serial.println("📡 AP активовано: " + String(AP_SSID));
+    Serial.println("📡 AP Активовано");
 }
 
 void stopAP() {
@@ -111,87 +127,72 @@ void stopAP() {
     webServer.stop();
     WiFi.softAPdisconnect(true);
     apRunning = false;
-    Serial.println("🛑 AP вимкнено для економії енергії");
-}
-
-// ================== WEB СЕРВЕР ТА ПОРТАЛ ==================
-void handleRoot() {
-    webServer.send_P(200, "text/html", index_html);
-}
-
-void handleNotFound() {
-    webServer.sendHeader("Location", "http://" + apIP.toString(), true);
-    webServer.send(302, "text/plain", "");
+    Serial.println("🛑 AP Вимкнено");
 }
 
 void handleConnect() {
-    if (!webServer.hasArg("ssid") || !webServer.hasArg("password")) {
-        webServer.send(400, "text/plain", "Помилка даних");
-        return;
-    }
-
     String ssid = webServer.arg("ssid");
     String pass = webServer.arg("password");
-
     if (deviceId.isEmpty()) deviceId = generateIdentifier();
 
-    Serial.println("🔄 Спроба підключення до: " + ssid);
     WiFi.begin(ssid.c_str(), pass.c_str());
-
     int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < WIFI_TRIES) {
-        delay(300);
-        tries++;
-    }
+    while (WiFi.status() != WL_CONNECTED && tries < 40) { delay(250); tries++; }
 
     if (WiFi.status() == WL_CONNECTED) {
         saveCredentials(deviceId, ssid, pass);
         webServer.send(200, "text/html", getResultPage(deviceId, "SUCCESS"));
-        Serial.println("✅ WiFi OK!");
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     } else {
         webServer.send(200, "text/html", getResultPage(deviceId, "FAILED"));
-        Serial.println("❌ Помилка WiFi");
     }
 }
 
 // ================== SETUP & LOOP ==================
 void setup() {
     Serial.begin(115200);
-    delay(500);
+    myServo.attach(servoPin);
+    myServo.write(0);
 
     String savedSsid, savedPass, savedDevId;
     bool hasData = loadCredentials(savedDevId, savedSsid, savedPass);
 
     WiFi.mode(WIFI_AP_STA);
-
-    if (!hasData) {
-        startAP();
-    } else {
+    if (hasData) {
         deviceId = savedDevId;
         WiFi.begin(savedSsid.c_str(), savedPass.c_str());
-        startAP(); // Даємо можливість переналаштувати протягом AP_KEEP_TIME
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     }
+    startAP();
 
-    webServer.on("/", HTTP_GET, handleRoot);
+    webServer.on("/", HTTP_GET, []() { webServer.send_P(200, "text/html", index_html); });
     webServer.on("/connect", HTTP_POST, handleConnect);
-    webServer.onNotFound(handleNotFound);
+    webServer.onNotFound([]() {
+        webServer.sendHeader("Location", "http://192.168.4.1", true);
+        webServer.send(302, "text/plain", "");
+    });
     webServer.begin();
 }
 
 void loop() {
-    dnsServer.processNextRequest(); // Має викликатися якомога частіше
     webServer.handleClient();
+    dnsServer.processNextRequest();
 
-    // Вимикаємо точку доступу через 2 хвилини після успішного підключення
     if (apRunning && WiFi.status() == WL_CONNECTED && (millis() - apStartTime > AP_KEEP_TIME)) {
         stopAP();
     }
 
-    // Запит розкладу раз на хвилину
     if (WiFi.status() == WL_CONNECTED) {
+        // Оновлення розкладу раз на хвилину
         if (millis() - lastFetchTime > FETCH_INTERVAL) {
             fetchSchedule();
             lastFetchTime = millis();
+        }
+        // Перевірка будильника щосекунди
+        static unsigned long lastTimeCheck = 0;
+        if (millis() - lastTimeCheck > 1000) {
+            checkTimeAndAlarm();
+            lastTimeCheck = millis();
         }
     }
 }
