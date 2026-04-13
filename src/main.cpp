@@ -28,9 +28,6 @@ const int   daylightOffset_sec = 0;     // Вже враховано в офсе
 #define FETCH_INTERVAL 60000UL 
 #define AP_KEEP_TIME 120000UL
 
-const String serverUrl = "https://pill-box-e03y.onrender.com/api/schedule";
-const String secret = "12345678";
-
 String deviceId = "";
 String targetTime = ""; // Час із БД
 bool apRunning = false;
@@ -69,7 +66,7 @@ void fetchSchedule() {
     if (client) {
         client->setInsecure();
         HTTPClient http;
-        String fullUrl = String(serverUrl) + "?device_id=" + deviceId + "&secret=" + secret;
+        String fullUrl = String(REGISTER_URL) + "?device_id=" + deviceId + "&secret=" + SECRET;
         
         if (http.begin(*client, fullUrl)) {
             int httpResponseCode = http.GET();
