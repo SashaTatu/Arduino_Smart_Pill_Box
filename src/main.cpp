@@ -9,8 +9,8 @@
 #include <ESP32Servo.h>
 #include "time.h"
 
-#include "config.h"      // AP_SSID, AP_PASSWORD, REGISTER_URL, SECRET
-#include "utils.h"       // generateIdentifier()
+#include "config.h"      
+#include "utils.h"       
 #include "index_html.h"  
 #include "result_html.h" 
 
@@ -21,9 +21,10 @@ DNSServer dnsServer;
 Servo myServo;
 
 const int servoPin = 18; 
+const int touchPin = 19;        
 const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = 10800;      // GMT+3
-const int   daylightOffset_sec = 0;
+const long gmtOffset_sec = 10800;      
+const int  daylightOffset_sec = 0;
 
 #define FETCH_INTERVAL 60000UL 
 String deviceId = "";
@@ -31,30 +32,56 @@ String targetTime = "";
 bool apRunning = false;
 unsigned long lastFetchTime = 0;
 
-// Змінні для збереження стану серво
+// Змінні стану
 int currentServoAngle = 0;    
-const int stepAngle = 58; // Крок повороту (змініть під свою кількість комірок)
+const int stepAngle = 45;       // Для 8 слотів: 360 / 8 = 45 градусів (якщо серво 360) 
+                                // Або підберіть кут під ваш механізм
+int currentSlot = 0;            // Змінна слоту (0-7)
+bool waitingForConfirmation = false; 
+bool wasExecutedToday = false; 
 
-// ================== ЛОГІКА СЕРВО ==================
+// ================== ЛОГІКА СЕРВО ТА КНОПКИ ==================
+
 void rotatePillDispenser() {
-    Serial.println("💊 ЧАС ПРИЙОМУ! Поворот механізму...");
+    Serial.println("💊 ЧАС ПРИЙОМУ!");
     
-    currentServoAngle += stepAngle;
+    // 1. Збільшуємо номер слоту
+    currentSlot++;
+    if (currentSlot > 7) {
+        currentSlot = 0; // Скидання після 7-го слоту
+    }
 
-    // Скидання в нуль при досягненні ліміту (для стандартних серво 0-180)
-    if (currentServoAngle > 180) {
-        Serial.println("🔄 Коло завершено, повернення до 0°");
+    // 2. Логіка повороту серво
+    currentServoAngle += stepAngle;
+    if (currentServoAngle >= 180) { // Для стандартного серво 0-180
         currentServoAngle = 0;
     }
 
     myServo.write(currentServoAngle);
     
-    Serial.print("✅ Зупинка на куті: ");
+    Serial.print("✅ Перехід до слоту №: ");
+    Serial.println(currentSlot);
+    Serial.print("📐 Кут серво: ");
     Serial.println(currentServoAngle);
+
+    waitingForConfirmation = true;
+    wasExecutedToday = true; 
+}
+
+void handleTouchSensor() {
+    if (waitingForConfirmation && digitalRead(touchPin) == HIGH) {
+        Serial.print("🎯 Слот №");
+        Serial.print(currentSlot);
+        Serial.println(" підтверджено користувачем.");
+        waitingForConfirmation = false;
+        delay(1000); 
+    }
 }
 
 // ================== СИНХРОНІЗАЦІЯ ЧАСУ ==================
 void checkTimeAndAlarm() {
+    if (wasExecutedToday || waitingForConfirmation) return;
+
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) return;
 
@@ -63,7 +90,6 @@ void checkTimeAndAlarm() {
 
     if (targetTime != "" && String(currentTime) == targetTime) {
         rotatePillDispenser();
-        targetTime = ""; // Скидаємо до наступного оновлення
     }
 }
 
@@ -84,12 +110,17 @@ void fetchSchedule() {
                 DynamicJsonDocument doc(1024);
                 deserializeJson(doc, payload);
 
+                String newTime = "";
                 if (doc.containsKey("time")) {
-                    targetTime = doc["time"].as<String>();
+                    newTime = doc["time"].as<String>();
                 } else if (doc["schedule"].size() > 0) {
-                    targetTime = doc["schedule"][0]["times"][0].as<String>();
+                    newTime = doc["schedule"][0]["times"][0].as<String>();
                 }
-                Serial.println("🕒 Отримано розклад на: " + targetTime);
+
+                if (newTime != targetTime) {
+                    targetTime = newTime;
+                    wasExecutedToday = false; 
+                }
             }
             http.end();
         }
@@ -140,7 +171,7 @@ void startAP() {
             saveCredentials(deviceId, ssid, pass);
             webServer.send(200, "text/html", getResultPage(deviceId, "SUCCESS"));
             delay(2000);
-            ESP.restart(); // Перезавантаження для чистого входу в STA
+            ESP.restart();
         } else {
             webServer.send(200, "text/html", getResultPage(deviceId, "FAILED"));
         }
@@ -152,26 +183,27 @@ void startAP() {
     });
 
     webServer.begin();
-    Serial.println("📡 Точка доступу: http://192.168.4.1");
 }
 
 // ================== SETUP ==================
 void setup() {
     Serial.begin(115200);
-    myServo.attach(servoPin);
-    myServo.write(currentServoAngle); // Початкова позиція
+    delay(1000); // Даємо час порту ініціалізуватися
+    Serial.println("\n--- ПРИСТРІЙ ЗАПУЩЕНО ---");
+    pinMode(touchPin, INPUT); 
+    
+    myServo.setPeriodHertz(50);
+    myServo.attach(servoPin, 500, 2400); 
+    myServo.write(currentServoAngle);
 
     String sSsid, sPass, sDevId;
     if (loadCredentials(sDevId, sSsid, sPass)) {
-        // Якщо дані є - намагаємось підключитись
         deviceId = sDevId;
-        Serial.print("📡 Спроба підключення до: "); Serial.println(sSsid);
-        
         WiFi.mode(WIFI_STA);
         WiFi.begin(sSsid.c_str(), sPass.c_str());
 
         int counter = 0;
-        while (WiFi.status() != WL_CONNECTED && counter < 30) {
+        while (WiFi.status() != WL_CONNECTED && counter < 20) {
             delay(500);
             Serial.print(".");
             counter++;
@@ -181,12 +213,9 @@ void setup() {
             Serial.println("\n✅ WiFi підключено!");
             configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
         } else {
-            Serial.println("\n❌ Помилка підключення. Вмикаю AP...");
             startAP();
         }
     } else {
-        // Даних немає - одразу вмикаємо AP
-        Serial.println("ℹ️ Дані відсутні. Вмикаю режим налаштування...");
         startAP();
     }
 }
@@ -199,17 +228,27 @@ void loop() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        // Оновлення розкладу
+        handleTouchSensor();
+
         if (millis() - lastFetchTime > FETCH_INTERVAL) {
             fetchSchedule();
             lastFetchTime = millis();
         }
         
-        // Перевірка часу кожну секунду
         static unsigned long lastCheck = 0;
         if (millis() - lastCheck > 1000) {
             checkTimeAndAlarm();
             lastCheck = millis();
+        }
+
+        // Скидання блокування повторного спрацювання
+        struct tm timeinfo;
+        if (wasExecutedToday && getLocalTime(&timeinfo)) {
+            char currentTime[6];
+            strftime(currentTime, sizeof(currentTime), "%H:%M", &timeinfo);
+            if (String(currentTime) != targetTime) {
+                wasExecutedToday = false; 
+            }
         }
     }
 }
