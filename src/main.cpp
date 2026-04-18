@@ -28,6 +28,7 @@ const int  daylightOffset_sec = 0;
 
 #define FETCH_INTERVAL 60000UL 
 String deviceId = "";
+String userId = "";
 String targetTime = ""; 
 bool apRunning = false;
 unsigned long lastFetchTime = 0;
@@ -39,6 +40,55 @@ const int stepAngle = 45;       // Для 8 слотів: 360 / 8 = 45 град�
 int currentSlot = 0;            // Змінна слоту (0-7)
 bool waitingForConfirmation = false; 
 bool wasExecutedToday = false; 
+bool warningSentToday = false;
+
+
+
+// ================== ВІДПРАВКА ЛОГУ НА СЕРВЕР ==================
+void sendLogToServer(String eventName) {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    WiFiClientSecure *client = new WiFiClientSecure;
+    if (client) {
+        client->setInsecure();
+        HTTPClient http;
+        
+        // Формуємо URL
+        String logUrl = String(LOG_URL);
+        logUrl += "?user_id=" + userId;
+        logUrl += "&event=" + eventName; // Використовуємо аргумент (dispensed або taken)
+        logUrl += "&slot=" + String(currentSlot);
+        logUrl += "&secret=" + String(SECRET);
+
+        Serial.println("📤 Відправка логу (" + eventName + "): " + logUrl);
+
+        if (http.begin(*client, logUrl)) {
+            int httpResponseCode = http.GET();
+            Serial.printf("📡 Відповідь сервера: %d\n", httpResponseCode);
+            http.end();
+        }
+        delete client;
+    }
+}
+
+
+String getWarningTime(String timeStr) {
+    if (timeStr == "") return "";
+    int hours = timeStr.substring(0, 2).toInt();
+    int minutes = timeStr.substring(3, 5).toInt();
+
+    minutes -= 30;
+    if (minutes < 0) {
+        minutes += 60;
+        hours -= 1;
+        if (hours < 0) hours = 23;
+    }
+
+    char buf[6];
+    sprintf(buf, "%02d:%02d", hours, minutes);
+    return String(buf);
+}
+
 
 // ================== ЛОГІКА СЕРВО ТА КНОПКИ ==================
 
@@ -64,6 +114,8 @@ void rotatePillDispenser() {
     Serial.print("📐 Кут серво: ");
     Serial.println(currentServoAngle);
 
+    sendLogToServer("open");
+
     waitingForConfirmation = true;
     wasExecutedToday = true; 
 }
@@ -73,6 +125,9 @@ void handleTouchSensor() {
         Serial.print("🎯 Слот №");
         Serial.print(currentSlot);
         Serial.println(" підтверджено користувачем.");
+
+        sendLogToServer("taken");
+
         waitingForConfirmation = false;
         delay(1000); 
     }
@@ -80,15 +135,25 @@ void handleTouchSensor() {
 
 // ================== СИНХРОНІЗАЦІЯ ЧАСУ ==================
 void checkTimeAndAlarm() {
-    if (wasExecutedToday || waitingForConfirmation) return;
-
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) return;
 
     char currentTime[6];
     strftime(currentTime, sizeof(currentTime), "%H:%M", &timeinfo);
+    String currentStr = String(currentTime);
 
-    if (targetTime != "" && String(currentTime) == targetTime) {
+    if (targetTime == "") return;
+
+    // --- ЛОГІКА ЗА 30 ХВИЛИН ---
+    String warningTime = getWarningTime(targetTime);
+    if (!warningSentToday && currentStr == warningTime) {
+        Serial.println("🔔 Попередження: до прийому залишилось 30 хв");
+        sendLogToServer("remind");
+        warningSentToday = true; 
+    }
+
+    // --- ОСНОВНА ЛОГІКА ПРИЙОМУ ---
+    if (!wasExecutedToday && !waitingForConfirmation && currentStr == targetTime) {
         rotatePillDispenser();
     }
 }
@@ -101,26 +166,47 @@ void fetchSchedule() {
     if (client) {
         client->setInsecure();
         HTTPClient http;
-        String fullUrl = String(REGISTER_URL) + "?device_id=" + deviceId + "&secret=" + SECRET;
+        String fullUrl = String(SCHEDULE_URL) + "?device_id=" + deviceId + "&secret=" + SECRET;
+        
+        Serial.println("🌐 Запит до сервера...");
         
         if (http.begin(*client, fullUrl)) {
             int httpResponseCode = http.GET();
             if (httpResponseCode == 200) {
                 String payload = http.getString();
+                Serial.println("📥 Отримано дані: " + payload);
+
                 DynamicJsonDocument doc(1024);
-                deserializeJson(doc, payload);
+                DeserializationError error = deserializeJson(doc, payload);
 
-                String newTime = "";
-                if (doc.containsKey("time")) {
-                    newTime = doc["time"].as<String>();
-                } else if (doc["schedule"].size() > 0) {
-                    newTime = doc["schedule"][0]["times"][0].as<String>();
-                }
+                if (!error) {
+                    // --- ВИТЯГУЄМО USER_ID ---
+                    if (doc.containsKey("user_id")) {
+                        userId = doc["user_id"].as<String>();
+                        Serial.print("👤 User ID: ");
+                        Serial.println(userId);
+                    }
 
-                if (newTime != targetTime) {
-                    targetTime = newTime;
-                    wasExecutedToday = false; 
+                    // --- ЛОГІКА ЧАСУ (залишається як була) ---
+                    String newTime = "";
+                    if (doc.containsKey("time")) {
+                        newTime = doc["time"].as<String>();
+                    } else if (doc.containsKey("schedule") && doc["schedule"].size() > 0) {
+                        newTime = doc["schedule"][0]["times"][0].as<String>();
+                    }
+
+                    if (newTime != "" && newTime != targetTime) {
+                        targetTime = newTime;
+                        wasExecutedToday = false; 
+                        Serial.println("⏰ Новий час встановлено: " + targetTime);
+                    }
+                } else {
+                    Serial.print("❌ Помилка парсингу JSON: ");
+                    Serial.println(error.c_str());
                 }
+            } else {
+                Serial.print("⚠️ Помилка HTTP: ");
+                Serial.println(httpResponseCode);
             }
             http.end();
         }
