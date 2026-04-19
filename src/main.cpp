@@ -21,7 +21,7 @@ DNSServer dnsServer;
 Servo myServo;
 
 const int servoPin = 18; 
-const int touchPin = 19;        
+const int touchPin = 19;         
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 10800;      
 const int  daylightOffset_sec = 0;
@@ -35,13 +35,18 @@ unsigned long lastFetchTime = 0;
 
 // Змінні стану
 int currentServoAngle = 0;    
-const int stepAngle = 45;       // Для 8 слотів: 360 / 8 = 45 градусів (якщо серво 360) 
-                                // Або підберіть кут під ваш механізм
-int currentSlot = 0;            // Змінна слоту (0-7)
+const int stepAngle = 45;       
+int currentSlot = 0;            
 bool waitingForConfirmation = false; 
 bool wasExecutedToday = false; 
-bool warningSentToday = false;
 
+// --- ЧАСОВІ ПОРЕГИ ТА ПРАПОРЦІ ---
+unsigned long dispenserActionTime = 0;    
+bool reminderSent = false;                
+bool missedSent = false;                  
+
+const unsigned long REMINDER_DELAY = 2 * 60 * 1000; // 20 хвилин
+const unsigned long MISSED_DELAY   = 6 * 60 * 1000; // 60 хвилин (1 година)
 
 
 // ================== ВІДПРАВКА ЛОГУ НА СЕРВЕР ==================
@@ -53,14 +58,13 @@ void sendLogToServer(String eventName) {
         client->setInsecure();
         HTTPClient http;
         
-        // Формуємо URL
         String logUrl = String(LOG_URL);
         logUrl += "?user_id=" + userId;
-        logUrl += "&event=" + eventName; // Використовуємо аргумент (dispensed або taken)
+        logUrl += "&event=" + eventName; 
         logUrl += "&slot=" + String(currentSlot);
         logUrl += "&secret=" + String(SECRET);
 
-        Serial.println("📤 Відправка логу (" + eventName + "): " + logUrl);
+        Serial.println("📤 Відправка логу [" + eventName + "]: " + logUrl);
 
         if (http.begin(*client, logUrl)) {
             int httpResponseCode = http.GET();
@@ -71,64 +75,38 @@ void sendLogToServer(String eventName) {
     }
 }
 
-
-String getWarningTime(String timeStr) {
-    if (timeStr == "") return "";
-    int hours = timeStr.substring(0, 2).toInt();
-    int minutes = timeStr.substring(3, 5).toInt();
-
-    minutes -= 30;
-    if (minutes < 0) {
-        minutes += 60;
-        hours -= 1;
-        if (hours < 0) hours = 23;
-    }
-
-    char buf[6];
-    sprintf(buf, "%02d:%02d", hours, minutes);
-    return String(buf);
-}
-
-
 // ================== ЛОГІКА СЕРВО ТА КНОПКИ ==================
 
 void rotatePillDispenser() {
     Serial.println("💊 ЧАС ПРИЙОМУ!");
     
-    // 1. Збільшуємо номер слоту
     currentSlot++;
-    if (currentSlot > 7) {
-        currentSlot = 0; // Скидання після 7-го слоту
-    }
+    if (currentSlot > 7) currentSlot = 0;
 
-    // 2. Логіка повороту серво
     currentServoAngle += stepAngle;
-    if (currentServoAngle >= 180) { // Для стандартного серво 0-180
-        currentServoAngle = 0;
-    }
+    if (currentServoAngle >= 180) currentServoAngle = 0;
 
     myServo.write(currentServoAngle);
     
-    Serial.print("✅ Перехід до слоту №: ");
-    Serial.println(currentSlot);
-    Serial.print("📐 Кут серво: ");
-    Serial.println(currentServoAngle);
-
     sendLogToServer("open");
 
+    // Скидання станів для нового циклу прийому
     waitingForConfirmation = true;
     wasExecutedToday = true; 
+    reminderSent = false;           
+    missedSent = false;
+    dispenserActionTime = millis(); 
 }
 
 void handleTouchSensor() {
     if (waitingForConfirmation && digitalRead(touchPin) == HIGH) {
-        Serial.print("🎯 Слот №");
-        Serial.print(currentSlot);
-        Serial.println(" підтверджено користувачем.");
-
+        Serial.println("🎯 Прийом підтверджено користувачем.");
         sendLogToServer("taken");
 
+        // Скасовуємо всі очікування
         waitingForConfirmation = false;
+        reminderSent = true; 
+        missedSent = true;
         delay(1000); 
     }
 }
@@ -142,18 +120,9 @@ void checkTimeAndAlarm() {
     strftime(currentTime, sizeof(currentTime), "%H:%M", &timeinfo);
     String currentStr = String(currentTime);
 
-    if (targetTime == "") return;
+    if (targetTime == "" || wasExecutedToday) return;
 
-    // --- ЛОГІКА ЗА 30 ХВИЛИН ---
-    String warningTime = getWarningTime(targetTime);
-    if (!warningSentToday && currentStr == warningTime) {
-        Serial.println("🔔 Попередження: до прийому залишилось 30 хв");
-        sendLogToServer("remind");
-        warningSentToday = true; 
-    }
-
-    // --- ОСНОВНА ЛОГІКА ПРИЙОМУ ---
-    if (!wasExecutedToday && !waitingForConfirmation && currentStr == targetTime) {
+    if (currentStr == targetTime) {
         rotatePillDispenser();
     }
 }
@@ -168,26 +137,16 @@ void fetchSchedule() {
         HTTPClient http;
         String fullUrl = String(SCHEDULE_URL) + "?device_id=" + deviceId + "&secret=" + SECRET;
         
-        Serial.println("🌐 Запит до сервера...");
-        
         if (http.begin(*client, fullUrl)) {
             int httpResponseCode = http.GET();
             if (httpResponseCode == 200) {
                 String payload = http.getString();
-                Serial.println("📥 Отримано дані: " + payload);
-
                 DynamicJsonDocument doc(1024);
                 DeserializationError error = deserializeJson(doc, payload);
 
                 if (!error) {
-                    // --- ВИТЯГУЄМО USER_ID ---
-                    if (doc.containsKey("user_id")) {
-                        userId = doc["user_id"].as<String>();
-                        Serial.print("👤 User ID: ");
-                        Serial.println(userId);
-                    }
+                    if (doc.containsKey("user_id")) userId = doc["user_id"].as<String>();
 
-                    // --- ЛОГІКА ЧАСУ (залишається як була) ---
                     String newTime = "";
                     if (doc.containsKey("time")) {
                         newTime = doc["time"].as<String>();
@@ -198,15 +157,9 @@ void fetchSchedule() {
                     if (newTime != "" && newTime != targetTime) {
                         targetTime = newTime;
                         wasExecutedToday = false; 
-                        Serial.println("⏰ Новий час встановлено: " + targetTime);
+                        Serial.println("⏰ Новий час: " + targetTime);
                     }
-                } else {
-                    Serial.print("❌ Помилка парсингу JSON: ");
-                    Serial.println(error.c_str());
                 }
-            } else {
-                Serial.print("⚠️ Помилка HTTP: ");
-                Serial.println(httpResponseCode);
             }
             http.end();
         }
@@ -214,7 +167,7 @@ void fetchSchedule() {
     }
 }
 
-// ================== WIFI ПРЕРЕФЕНСИ ==================
+// ================== WIFI PREFERENCES ==================
 bool loadCredentials(String &devId, String &ssid, String &pass) {
     prefs.begin("device", false);
     devId = prefs.getString("deviceId", "");
@@ -232,54 +185,42 @@ void saveCredentials(const String &devId, const String &ssid, const String &pass
     prefs.end();
 }
 
-// ================== ТОЧКА ДОСТУПУ (AP) ==================
 void startAP() {
     apRunning = true;
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
     WiFi.softAP(AP_SSID, AP_PASSWORD);
     dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-
-    webServer.on("/", HTTP_GET, []() {
-        webServer.send_P(200, "text/html", index_html);
-    });
-
+    webServer.on("/", HTTP_GET, []() { webServer.send_P(200, "text/html", index_html); });
     webServer.on("/connect", HTTP_POST, []() {
         String ssid = webServer.arg("ssid");
         String pass = webServer.arg("password");
         if (deviceId == "") deviceId = generateIdentifier();
-
         WiFi.begin(ssid.c_str(), pass.c_str());
         int tries = 0;
         while (WiFi.status() != WL_CONNECTED && tries < 30) { delay(500); tries++; }
-
         if (WiFi.status() == WL_CONNECTED) {
             saveCredentials(deviceId, ssid, pass);
             webServer.send(200, "text/html", getResultPage(deviceId, "SUCCESS"));
-            delay(2000);
-            ESP.restart();
+            delay(2000); ESP.restart();
         } else {
             webServer.send(200, "text/html", getResultPage(deviceId, "FAILED"));
         }
     });
-
     webServer.onNotFound([]() {
         webServer.sendHeader("Location", "http://192.168.4.1", true);
         webServer.send(302, "text/plain", "");
     });
-
     webServer.begin();
 }
 
 // ================== SETUP ==================
 void setup() {
     Serial.begin(115200);
-    delay(1000); // Даємо час порту ініціалізуватися
-    Serial.println("\n--- ПРИСТРІЙ ЗАПУЩЕНО ---");
     pinMode(touchPin, INPUT); 
-    
     myServo.setPeriodHertz(50);
-    myServo.attach(servoPin, 500, 2400); 
+    myServo.attach(servoPin, 500, 2400);
+    myServo.write(90); delay(500); myServo.write(0); 
     myServo.write(currentServoAngle);
 
     String sSsid, sPass, sDevId;
@@ -287,23 +228,13 @@ void setup() {
         deviceId = sDevId;
         WiFi.mode(WIFI_STA);
         WiFi.begin(sSsid.c_str(), sPass.c_str());
-
         int counter = 0;
-        while (WiFi.status() != WL_CONNECTED && counter < 20) {
-            delay(500);
-            Serial.print(".");
-            counter++;
-        }
-
+        while (WiFi.status() != WL_CONNECTED && counter < 20) { delay(500); Serial.print("."); counter++; }
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.println("\n✅ WiFi підключено!");
+            Serial.println("\n✅ WiFi OK");
             configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-        } else {
-            startAP();
-        }
-    } else {
-        startAP();
-    }
+        } else { startAP(); }
+    } else { startAP(); }
 }
 
 // ================== LOOP ==================
@@ -327,7 +258,30 @@ void loop() {
             lastCheck = millis();
         }
 
-        // Скидання блокування повторного спрацювання
+        // --- ЛОГІКА ТАЙМЕРІВ (Remind та Missed) ---
+        if (waitingForConfirmation) {
+            unsigned long timePassed = millis() - dispenserActionTime;
+
+            // 1. Нагадування через 20 хвилин
+            if (!reminderSent && timePassed >= REMINDER_DELAY) {
+                Serial.println("🔔 Нагадування (20 хв)");
+                sendLogToServer("remind");
+                reminderSent = true; 
+            }
+
+            // 2. Пропуск через 60 хвилин
+            if (!missedSent && timePassed >= MISSED_DELAY) {
+                Serial.println("⚠️ Пропущено (60 хв)");
+                sendLogToServer("missed");
+                missedSent = true; 
+                
+                // Опціонально: можна вимкнути waitingForConfirmation тут, 
+                // якщо ми вважаємо, що після години підтвердження вже не актуальне.
+                // waitingForConfirmation = false; 
+            }
+        }
+
+        // Скидання прапорця виконання для наступного дня/часу
         struct tm timeinfo;
         if (wasExecutedToday && getLocalTime(&timeinfo)) {
             char currentTime[6];
