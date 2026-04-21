@@ -8,6 +8,9 @@
 #include <ArduinoJson.h>
 #include <ESP32Servo.h>
 #include "time.h"
+#include "DHT.h"
+#include <Wire.h> 
+#include <LiquidCrystal_I2C.h>
 
 #include "config.h"      
 #include "utils.h"       
@@ -19,6 +22,7 @@ Preferences prefs;
 WebServer webServer(80);
 DNSServer dnsServer;
 Servo myServo;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 const int servoPin = 18; 
 const int touchPin = 19;
@@ -50,6 +54,64 @@ const unsigned long REMINDER_DELAY = 2 * 60 * 1000; // 20 хвилин
 const unsigned long MISSED_DELAY   = 6 * 60 * 1000; // 60 хвилин (1 година)
 
 
+unsigned long previousMillis = 0; 
+const long interval = 600000;
+
+// ================== Temp and Hum ==================
+
+#define DHTPIN 27
+#define DHTTYPE DHT11
+
+DHT dht(DHTPIN, DHTTYPE);
+
+// Глобальні змінні для зберігання останніх показників
+float humidity = 0;
+float temperature = 0;
+
+
+//==== іконки для LCD (можна розширити за потребою) ====
+// Іконка термометра
+byte termometerChar[8] = {
+  0b00100,
+  0b01010,
+  0b01010,
+  0b01110,
+  0b01110,
+  0b11111,
+  0b11111,
+  0b01110
+};
+
+// Іконка краплі (вологість)
+byte humidityChar[8] = {
+  0b00100,
+  0b00100,
+  0b01010,
+  0b01010,
+  0b10001,
+  0b10001,
+  0b10001,
+  0b01110
+};
+
+// Іконка газу
+byte gasChar[8] = {
+  0b00000,
+  0b01010,
+  0b11111,
+  0b11111,
+  0b11111,
+  0b01010,
+  0b11111,
+  0b00000
+};
+
+// ================== AIR ==================
+
+
+#define MQ135_PIN 34
+
+int airQuality = 0;
 
 // ================== Музика ==================
 
@@ -106,6 +168,85 @@ void sendLogToServer(String eventName) {
     }
 }
 
+
+void updateSensorData() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  // Перевірка, чи дані коректні
+  if (isnan(h) || isnan(t)) {
+    Serial.println("[-] Помилка зчитування з датчика DHT!");
+    return; // Виходимо з функції, якщо помилка
+  }
+
+  // Оновлюємо значення
+  humidity = h;
+  temperature = t;
+}
+
+
+void readAirQuality() {
+  int sensorValue = analogRead(MQ135_PIN); // Зчитуємо аналогове значення
+  airQuality = sensorValue;
+}
+
+
+// =================== ВІДОБРАЖЕННЯ НА LCD ==================
+
+void displayData() {
+  lcd.clear();
+  
+  // Рядок 1: T та H
+  lcd.setCursor(0, 0);
+  
+  lcd.write(0); // Термометр
+  lcd.print(" ");
+  lcd.print((int)temperature);
+  lcd.write(223); // Градус
+  lcd.print("C  ");
+  
+  lcd.write(1); // Крапля
+  lcd.print(" ");
+  lcd.print((int)humidity);
+  lcd.print("%");
+
+  // Рядок 2: Air Quality
+  lcd.setCursor(0, 1);
+  lcd.write(2); // Газ
+  lcd.print(" ");
+  
+  if (airQuality < 100) lcd.print(" ");
+  if (airQuality < 10) lcd.print(" ");
+  lcd.print(airQuality);
+  
+  lcd.print(" [");
+  if(airQuality > 700) {
+    lcd.print("BAD]"); 
+  } else if(airQuality > 400) {
+    lcd.print("WRN]"); 
+  } else {
+    lcd.print(" OK]"); 
+  }
+}
+
+
+
+void displayReminder() {
+  lcd.clear();
+  
+  // Перший рядок: час прийому
+  lcd.setCursor(0, 0);
+  lcd.print("Time: ");
+  lcd.print(targetTime); // Виводить ваш час, наприклад, 14:30
+  
+  // Додамо маленьку іконку годинника або знак оклику, якщо хочете
+  lcd.setCursor(15, 0);
+  lcd.print("!");
+
+  // Другий рядок: заклик до дії
+  lcd.setCursor(0, 1);
+  lcd.print("TAKE YOUR PILL!");
+}
 // ================== ЛОГІКА СЕРВО ТА КНОПКИ ==================
 
 void rotatePillDispenser() {
@@ -142,6 +283,7 @@ void handleTouchSensor() {
     if (waitingForConfirmation && digitalRead(touchPin) == HIGH) {
         Serial.println("🎯 Прийом підтверджено користувачем.");
         sendLogToServer("taken");
+        displayData(); // Повертаємо основний дисплей
 
         // Скасовуємо всі очікування
         waitingForConfirmation = false;
@@ -150,6 +292,13 @@ void handleTouchSensor() {
         delay(1000); 
     }
 }
+
+
+
+
+
+
+
 
 // ================== СИНХРОНІЗАЦІЯ ЧАСУ ==================
 void checkTimeAndAlarm() {
@@ -164,6 +313,7 @@ void checkTimeAndAlarm() {
 
     if (currentStr == targetTime) {
         rotatePillDispenser();
+        displayReminder();
     }
 }
 
@@ -260,6 +410,28 @@ void setup() {
     pinMode(touchPin, INPUT); 
     pinMode(buzzerPin, OUTPUT);
 
+    // 1. Спочатку ініціалізація дисплея
+    Wire.begin(16, 17); // SDA, SCL
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+
+    lcd.createChar(0, termometerChar);
+    lcd.createChar(1, humidityChar);
+    lcd.createChar(2, gasChar);
+
+
+    lcd.setCursor(0, 0);
+    lcd.print("System Booting...");
+
+    // 2. Потім датчики
+    dht.begin();
+    updateSensorData();
+    readAirQuality();
+    
+    // 3. Виводимо перші дані, щоб екран не був порожнім
+    displayData();
+
     String sSsid, sPass, sDevId;
     if (loadCredentials(sDevId, sSsid, sPass)) {
         deviceId = sDevId;
@@ -317,6 +489,15 @@ void loop() {
                 // якщо ми вважаємо, що після години підтвердження вже не актуальне.
                 // waitingForConfirmation = false; 
             }
+        }
+
+
+        unsigned long currentMillis = millis();
+        if (currentMillis - previousMillis >= interval) {
+            previousMillis = currentMillis;
+            updateSensorData();
+            readAirQuality();
+            displayData(); // Тут всередині вже є lcd.clear()
         }
 
         // Скидання прапорця виконання для наступного дня/часу
