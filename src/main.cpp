@@ -220,8 +220,7 @@ void setup() {
     pinMode(touchPin, INPUT); 
     myServo.setPeriodHertz(50);
     myServo.attach(servoPin, 500, 2400);
-    myServo.write(90); delay(500); myServo.write(0); 
-    myServo.write(currentServoAngle);
+    myServo.write(0);
 
     String sSsid, sPass, sDevId;
     if (loadCredentials(sDevId, sSsid, sPass)) {

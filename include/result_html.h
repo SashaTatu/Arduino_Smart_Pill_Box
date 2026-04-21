@@ -4,7 +4,7 @@ String getResultPage(const String& deviceId, const String& apiResult) {
 <html lang="uk">
 <head>
 <meta charset="UTF-8">
-<title>SafePoint — Успішно</title>
+<title>Smart_Pill_Box — Успішно</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
   :root {

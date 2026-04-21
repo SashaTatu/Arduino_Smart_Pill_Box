@@ -5,7 +5,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <html lang="uk">
 <head>
 <meta charset="UTF-8">
-<title>SafePoint — Wi-Fi Налаштування</title>
+<title>Smart_Pill_Box — Wi-Fi Налаштування</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
   :root {
@@ -243,7 +243,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 </head>
 <body>
 <div class="card">
-  <h2>SafePoint</h2>
+  <h2>Smart_Pill_Box</h2>
   <form action="/connect" method="post">
     <div class="input-group">
       <label for="ssid">Мережа</label>
@@ -255,7 +255,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     </div>
     <button type="submit">🔗 Підключити</button>
   </form>
-  <p class="footer-text">💡 Введіть дані вашої Wi-Fi мережи для активації пристрою SafePoint</p>
+  <p class="footer-text">💡 Введіть дані вашої Wi-Fi мережи для активації пристрою Smart_Pill_Box</p>
 </div>
 </body>
 </html>
