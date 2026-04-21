@@ -21,7 +21,8 @@ DNSServer dnsServer;
 Servo myServo;
 
 const int servoPin = 18; 
-const int touchPin = 19;         
+const int touchPin = 19;
+const int buzzerPin = 14;         
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 10800;      
 const int  daylightOffset_sec = 0;
@@ -48,6 +49,36 @@ bool missedSent = false;
 const unsigned long REMINDER_DELAY = 2 * 60 * 1000; // 20 хвилин
 const unsigned long MISSED_DELAY   = 6 * 60 * 1000; // 60 хвилин (1 година)
 
+
+
+// ================== Музика ==================
+
+void beep(int duration) {
+    digitalWrite(buzzerPin, HIGH);
+    delay(duration);
+    digitalWrite(buzzerPin, LOW);
+    delay(60);
+}
+
+void playSuccessSound() {
+    beep(80);   // короткий старт
+    delay(80);
+    beep(80);   // підтвердження
+    delay(80);
+    beep(180);  // фінальний "вау"
+    delay(120);
+    beep(300);  // довгий завершальний сигнал
+}
+
+
+void playReminderSound() {
+    for (int i = 0; i < 2; i++) {
+        beep(120);
+        delay(200);
+        beep(120);
+        delay(400);
+    }
+}
 
 // ================== ВІДПРАВКА ЛОГУ НА СЕРВЕР ==================
 void sendLogToServer(String eventName) {
@@ -80,6 +111,10 @@ void sendLogToServer(String eventName) {
 void rotatePillDispenser() {
     Serial.println("💊 ЧАС ПРИЙОМУ!");
     
+    // 1. Підключаємо серво безпосередньо перед рухом
+    myServo.attach(servoPin, 500, 2400); 
+    delay(50); // Даємо час на стабілізацію
+
     currentSlot++;
     if (currentSlot > 7) currentSlot = 0;
 
@@ -88,9 +123,14 @@ void rotatePillDispenser() {
 
     myServo.write(currentServoAngle);
     
-    sendLogToServer("open");
+    delay(500); // Даємо час серво фізично доїхати до точки
+    
+    // 2. ВІДКЛЮЧАЄМО СЕРВО (detach), щоб воно не смикалося далі
+    myServo.detach(); 
 
-    // Скидання станів для нового циклу прийому
+    sendLogToServer("open");
+    playSuccessSound();
+
     waitingForConfirmation = true;
     wasExecutedToday = true; 
     reminderSent = false;           
@@ -218,9 +258,7 @@ void startAP() {
 void setup() {
     Serial.begin(115200);
     pinMode(touchPin, INPUT); 
-    myServo.setPeriodHertz(50);
-    myServo.attach(servoPin, 500, 2400);
-    myServo.write(0);
+    pinMode(buzzerPin, OUTPUT);
 
     String sSsid, sPass, sDevId;
     if (loadCredentials(sDevId, sSsid, sPass)) {
@@ -265,6 +303,7 @@ void loop() {
             if (!reminderSent && timePassed >= REMINDER_DELAY) {
                 Serial.println("🔔 Нагадування (20 хв)");
                 sendLogToServer("remind");
+                playReminderSound();
                 reminderSent = true; 
             }
 
